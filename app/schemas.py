@@ -15,3 +15,9 @@ class UserResponse(BaseModel):
 class LoginRequest(BaseModel):
     email: str
     password: str
+    
+class GroupCreate(BaseModel):
+    name: str
+    
+class AddMemberRequest(BaseModel):
+    user_id: int
