@@ -27,14 +27,14 @@ class GroupMember(Base):
     user_id:Mapped[int]=mapped_column(ForeignKey("users.id"), primary_key=True)
     joined_at:Mapped[datetime]=mapped_column(server_default=func.current_timestamp())
 
-class Expenses(Base):
+class Expense(Base):
     __tablename__="expenses"
     id:Mapped[int]=mapped_column(primary_key=True)
     group_id:Mapped[int]=mapped_column(ForeignKey("groups.id"))
     paid_by:Mapped[int]=mapped_column(ForeignKey("users.id"))
     amount_paise: Mapped[int]=mapped_column()
     description: Mapped[str]=mapped_column()
-    category:Mapped[str]=mapped_column()
+    category: Mapped[str | None] = mapped_column(nullable=True)
     
 class ExpenseSplit(Base):
     __tablename__="expense_splits"

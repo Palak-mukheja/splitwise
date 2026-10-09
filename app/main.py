@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi import Depends
+from app.services.split import calculate_equal_split
 from fastapi import HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
@@ -8,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 SECRET_KEY = "your-secret-key-change-this-later"
 ALGORITHM = "HS256"
 
+from app.schemas import ExpenseCreate
 from pwdlib import PasswordHash
 
 password_hash = PasswordHash.recommended()
@@ -16,7 +18,7 @@ from app.schemas import LoginRequest, RegisterRequest, GroupCreate, AddMemberReq
 from sqlalchemy import select
 
 from app.database import SessionLocal
-from app.models import User, Group, GroupMember
+from app.models import User, Group, GroupMember, Expense, ExpenseSplit
 
 
 def create_access_token(user_id: int):
@@ -312,3 +314,113 @@ def get_me(current_user: User = Depends(get_current_user)):
         "name": current_user.name,
         "created_at": current_user.created_at
     }
+    
+
+@app.post("/groups/{group_id}/expenses")
+def create_expense(
+    group_id: int,
+    expense: ExpenseCreate,
+    current_user: User = Depends(get_current_user)
+):
+    db = SessionLocal()
+
+    try:
+        # 1. Check whether the current user belongs to the group
+        stmt = select(GroupMember).where(
+            GroupMember.group_id == group_id,
+            GroupMember.user_id == current_user.id
+        )
+
+        result = db.execute(stmt)
+        current_user_membership = result.scalar_one_or_none()
+
+        if current_user_membership is None:
+            raise HTTPException(
+                status_code=403,
+                detail="You are not a member of this group"
+            )
+
+        # 2. Check whether the payer belongs to the group
+        stmt = select(GroupMember).where(
+            GroupMember.group_id == group_id,
+            GroupMember.user_id == expense.paid_by
+        )
+
+        result = db.execute(stmt)
+        paid_by_membership = result.scalar_one_or_none()
+
+        if expense.amount_paise <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Expense amount must be positive"
+            )
+
+        if paid_by_membership is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Payer is not a member of this group"
+            )
+
+        new_expense = Expense(
+            group_id=group_id,
+            paid_by=expense.paid_by,
+            amount_paise=expense.amount_paise,
+            description=expense.description
+        )
+
+        db.add(new_expense)
+        db.flush()
+
+        stmt = select(GroupMember).where(
+            GroupMember.group_id == group_id
+        )
+
+        result = db.execute(stmt)
+        memberships = result.scalars().all()
+
+        member_ids = [
+            membership.user_id
+            for membership in memberships
+        ]
+
+        splits = calculate_equal_split(
+            new_expense.amount_paise,
+            member_ids
+        )
+
+        for user_id, share_paise in splits:
+            split = ExpenseSplit(
+                expense_id=new_expense.id,
+                user_id=user_id,
+                share_paise=share_paise
+            )
+            db.add(split)
+
+        db.commit()
+        db.refresh(new_expense)
+
+        return {
+            "id": new_expense.id,
+            "group_id": new_expense.group_id,
+            "paid_by": new_expense.paid_by,
+            "amount_paise": new_expense.amount_paise,
+            "description": new_expense.description,
+            "splits": [
+                {
+                    "user_id": user_id,
+                    "share_paise": share_paise
+                }
+                for user_id, share_paise in splits
+            ]
+        }
+    except ValueError as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()

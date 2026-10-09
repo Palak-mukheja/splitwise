@@ -21,3 +21,8 @@ class GroupCreate(BaseModel):
     
 class AddMemberRequest(BaseModel):
     user_id: int
+    
+class ExpenseCreate(BaseModel):
+    amount_paise: int
+    description: str
+    paid_by: int
