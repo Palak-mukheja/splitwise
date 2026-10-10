@@ -1,3 +1,4 @@
+from decimal import Decimal
 
 def calculate_equal_split(total_paise, member_ids):
     if total_paise <= 0:
@@ -25,3 +26,85 @@ def calculate_equal_split(total_paise, member_ids):
         splits.append((member_id, share))
 
     return splits
+
+
+def calculate_exact_split(total_paise, splits):
+    if total_paise <= 0:
+        raise ValueError("Total expense must be positive")
+
+    if not splits:
+        raise ValueError("At least one split is required")
+
+    user_ids = [split.user_id for split in splits]
+
+    if len(user_ids) != len(set(user_ids)):
+        raise ValueError("Duplicate users are not allowed")
+
+    for split in splits:
+        if split.share_paise < 0:
+            raise ValueError("Share amounts cannot be negative")
+
+    total_shares = sum(
+        split.share_paise for split in splits
+    )
+
+    if total_shares != total_paise:
+        raise ValueError(
+            "Split amounts must equal the total expense"
+        )
+
+    return [
+        (split.user_id, split.share_paise)
+        for split in splits
+    ]
+
+
+def calculate_percentage_split(total_paise, splits):
+    if total_paise <= 0:
+        raise ValueError("Total expense must be positive")
+
+    if not splits:
+        raise ValueError("At least one split is required")
+
+    user_ids = [split.user_id for split in splits]
+
+    if len(user_ids) != len(set(user_ids)):
+        raise ValueError("Duplicate users are not allowed")
+
+    percentages = [split.percentage for split in splits]
+
+    if any(p < 0 or p > 100 for p in percentages):
+        raise ValueError("Percentages must be between 0 and 100")
+
+    if sum(percentages, Decimal("0")) != Decimal("100"):
+        raise ValueError("Percentages must add up to 100")
+
+    # Calculate each exact share in paise.
+    exact_shares = [
+        Decimal(total_paise) * percentage / Decimal("100")
+        for percentage in percentages
+    ]
+
+    # Initially assign only whole paise.
+    whole_shares = [
+        int(share) for share in exact_shares
+    ]
+
+    # How many paise remain undistributed?
+    remaining = total_paise - sum(whole_shares)
+
+    # Rank fractional remainders, largest first.
+    order = sorted(
+        range(len(splits)),
+        key=lambda i: exact_shares[i] - whole_shares[i],
+        reverse=True
+    )
+
+    # Give each remaining paisa to the next highest remainder.
+    for i in order[:remaining]:
+        whole_shares[i] += 1
+
+    return [
+        (split.user_id, whole_shares[i])
+        for i, split in enumerate(splits)
+    ]

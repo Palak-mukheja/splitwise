@@ -1,6 +1,11 @@
 from fastapi import FastAPI
+from app.schemas import PercentageExpenseCreate
+from app.services.split import calculate_percentage_split
 from fastapi import Depends
-from app.services.split import calculate_equal_split
+from app.services.split import (
+    calculate_equal_split,
+    calculate_exact_split,
+)
 from fastapi import HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
@@ -16,6 +21,8 @@ password_hash = PasswordHash.recommended()
 
 from app.schemas import LoginRequest, RegisterRequest, GroupCreate, AddMemberRequest
 from sqlalchemy import select
+from app.schemas import ExactExpenseCreate
+from app.services.split import calculate_exact_split
 
 from app.database import SessionLocal
 from app.models import User, Group, GroupMember, Expense, ExpenseSplit
@@ -384,9 +391,9 @@ def create_expense(
         ]
 
         splits = calculate_equal_split(
-            new_expense.amount_paise,
-            member_ids
-        )
+       new_expense.amount_paise,
+       member_ids
+)
 
         for user_id, share_paise in splits:
             split = ExpenseSplit(
@@ -422,5 +429,215 @@ def create_expense(
     except Exception:
         db.rollback()
         raise
+    finally:
+        db.close()
+
+@app.post("/groups/{group_id}/expenses/exact")
+def create_exact_expense(
+    group_id: int,
+    expense: ExactExpenseCreate,
+    current_user: User = Depends(get_current_user)
+):
+    db = SessionLocal()
+
+    try:
+        # 1. Check that the requester belongs to the group
+        stmt = select(GroupMember).where(
+            GroupMember.group_id == group_id,
+            GroupMember.user_id == current_user.id
+        )
+        current_membership = db.execute(
+            stmt
+        ).scalar_one_or_none()
+
+        if current_membership is None:
+            raise HTTPException(
+                status_code=403,
+                detail="You are not a member of this group"
+            )
+
+        # 2. Get all members of the group
+        stmt = select(GroupMember.user_id).where(
+            GroupMember.group_id == group_id
+        )
+        group_member_ids = set(
+            db.execute(stmt).scalars().all()
+        )
+
+        # 3. Check that the payer belongs to the group
+        if expense.paid_by not in group_member_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="Payer is not a member of this group"
+            )
+
+        # 4. Check that every split user belongs to the group
+        for split_item in expense.splits:
+            if split_item.user_id not in group_member_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"User {split_item.user_id} is not a member of this group"
+                )
+
+      
+        splits = calculate_equal_split(
+            new_expense.amount_paise,
+            member_ids
+            )
+
+
+        # 6. Create the expense
+        new_expense = Expense(
+            group_id=group_id,
+            paid_by=expense.paid_by,
+            amount_paise=expense.amount_paise,
+            description=expense.description
+        )
+
+        db.add(new_expense)
+        db.flush()
+
+        # 7. Create one database row per share
+        for user_id, share_paise in splits:
+            db.add(
+                ExpenseSplit(
+                    expense_id=new_expense.id,
+                    user_id=user_id,
+                    share_paise=share_paise
+                )
+            )
+
+        # 8. Save everything together
+        db.commit()
+        db.refresh(new_expense)
+
+        return {
+            "id": new_expense.id,
+            "group_id": new_expense.group_id,
+            "paid_by": new_expense.paid_by,
+            "amount_paise": new_expense.amount_paise,
+            "description": new_expense.description,
+            "split_type": "exact",
+            "splits": [
+                {
+                    "user_id": user_id,
+                    "share_paise": share_paise
+                }
+                for user_id, share_paise in splits
+            ]
+        }
+
+    except ValueError as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
+
+    except Exception:
+        db.rollback()
+        raise
+
+    finally:
+        db.close()
+
+
+@app.post("/groups/{group_id}/expenses/percentage")
+def create_percentage_expense(
+    group_id: int,
+    expense: PercentageExpenseCreate,
+    current_user: User = Depends(get_current_user)
+):
+    db = SessionLocal()
+
+    try:
+        # 1. Check that the requester belongs to the group
+        stmt = select(GroupMember).where(
+            GroupMember.group_id == group_id,
+            GroupMember.user_id == current_user.id
+        )
+        membership = db.execute(stmt).scalar_one_or_none()
+
+        if membership is None:
+            raise HTTPException(
+                status_code=403,
+                detail="You are not a member of this group"
+            )
+
+        # 2. Get all group member IDs
+        stmt = select(GroupMember.user_id).where(
+            GroupMember.group_id == group_id
+        )
+        group_member_ids = set(db.execute(stmt).scalars().all())
+
+        # 3. Validate the payer
+        if expense.paid_by not in group_member_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="Payer is not a member of this group"
+            )
+
+        # 4. Validate every split user
+        for split_item in expense.splits:
+            if split_item.user_id not in group_member_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"User {split_item.user_id} is not a member of this group"
+                )
+
+        # 5. Calculate percentage shares
+        splits = calculate_percentage_split(
+            expense.amount_paise,
+            expense.splits
+        )
+
+        # 6. Create the expense
+        new_expense = Expense(
+            group_id=group_id,
+            paid_by=expense.paid_by,
+            amount_paise=expense.amount_paise,
+            description=expense.description
+        )
+        db.add(new_expense)
+        db.flush()
+
+        # 7. Create the split records
+        for user_id, share_paise in splits:
+            db.add(
+                ExpenseSplit(
+                    expense_id=new_expense.id,
+                    user_id=user_id,
+                    share_paise=share_paise
+                )
+            )
+
+        # 8. Save everything in one transaction
+        db.commit()
+        db.refresh(new_expense)
+
+        return {
+            "id": new_expense.id,
+            "group_id": new_expense.group_id,
+            "paid_by": new_expense.paid_by,
+            "amount_paise": new_expense.amount_paise,
+            "description": new_expense.description,
+            "split_type": "percentage",
+            "splits": [
+                {
+                    "user_id": user_id,
+                    "share_paise": share_paise
+                }
+                for user_id, share_paise in splits
+            ]
+        }
+
+    except ValueError as error:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(error))
+
+    except Exception:
+        db.rollback()
+        raise
+
     finally:
         db.close()
