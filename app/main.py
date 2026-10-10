@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from app.schemas import PercentageExpenseCreate
+from app.services.split import calculate_balances
 from app.services.split import calculate_percentage_split
 from fastapi import Depends
 from app.services.split import (
@@ -638,6 +639,130 @@ def create_percentage_expense(
     except Exception:
         db.rollback()
         raise
+
+    finally:
+        db.close()
+
+
+@app.get("/groups/{group_id}/balances")
+def get_group_balances(
+    group_id: int,
+    current_user: User = Depends(get_current_user)
+):
+    db = SessionLocal()
+
+    try:
+        # 1. Check group membership
+        stmt = select(GroupMember).where(
+            GroupMember.group_id == group_id,
+            GroupMember.user_id == current_user.id
+        )
+        membership = db.execute(stmt).scalar_one_or_none()
+
+        if membership is None:
+            raise HTTPException(
+                status_code=403,
+                detail="You are not a member of this group"
+            )
+
+        # 2. Fetch all expenses in this group
+        stmt = select(Expense).where(
+            Expense.group_id == group_id
+        )
+        expenses = db.execute(stmt).scalars().all()
+
+        # 3. Fetch split records for those expenses
+        expense_ids = [expense.id for expense in expenses]
+
+        if expense_ids:
+            stmt = select(ExpenseSplit).where(
+                ExpenseSplit.expense_id.in_(expense_ids)
+            )
+            expense_splits = db.execute(stmt).scalars().all()
+        else:
+            expense_splits = []
+
+        # 4. Calculate balances
+        balances = calculate_balances(expenses, expense_splits)
+
+        # 5. Include group members with zero balances
+        stmt = select(GroupMember.user_id).where(
+            GroupMember.group_id == group_id
+        )
+        member_ids = db.execute(stmt).scalars().all()
+
+        for user_id in member_ids:
+            balances.setdefault(user_id, 0)
+
+        return {
+            "group_id": group_id,
+            "balances": [
+                {
+                    "user_id": user_id,
+                    "balance_paise": balance
+                }
+                for user_id, balance in sorted(balances.items())
+            ]
+        }
+
+    finally:
+        db.close()
+        
+
+@app.get("/groups/{group_id}/settlements/suggestions")
+def get_settlement_suggestions(
+    group_id: int,
+    current_user: User = Depends(get_current_user)
+):
+    db = SessionLocal()
+
+    try:
+        # 1. Check that the requester belongs to the group
+        stmt = select(GroupMember).where(
+            GroupMember.group_id == group_id,
+            GroupMember.user_id == current_user.id
+        )
+        membership = db.execute(stmt).scalar_one_or_none()
+
+        if membership is None:
+            raise HTTPException(
+                status_code=403,
+                detail="You are not a member of this group"
+            )
+
+        # 2. Fetch all expenses in the group
+        stmt = select(Expense).where(
+            Expense.group_id == group_id
+        )
+        expenses = db.execute(stmt).scalars().all()
+
+        # 3. Fetch splits belonging only to those expenses
+        expense_ids = [expense.id for expense in expenses]
+
+        if expense_ids:
+            stmt = select(ExpenseSplit).where(
+                ExpenseSplit.expense_id.in_(expense_ids)
+            )
+            expense_splits = db.execute(stmt).scalars().all()
+        else:
+            expense_splits = []
+
+        # 4. Calculate balances and settlement suggestions
+        balances = calculate_balances(expenses, expense_splits)
+        settlements = suggest_settlements(balances)
+
+        # 5. Return the suggested payments
+        return {
+            "group_id": group_id,
+            "settlements": [
+                {
+                    "from_user": from_user,
+                    "to_user": to_user,
+                    "amount_paise": amount_paise
+                }
+                for from_user, to_user, amount_paise in settlements
+            ]
+        }
 
     finally:
         db.close()

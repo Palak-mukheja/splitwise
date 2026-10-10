@@ -108,3 +108,108 @@ def calculate_percentage_split(total_paise, splits):
         (split.user_id, whole_shares[i])
         for i, split in enumerate(splits)
     ]
+
+
+def calculate_balances(expenses):
+    """
+    Calculate each user's net balance from a list of expenses.
+
+    Each expense must have:
+    - paid_by
+    - amount_paise
+    - splits: a list of objects with user_id and share_paise
+
+    Positive balance = user should receive money.
+    Negative balance = user owes money.
+    """
+    balances = {}
+
+    for expense in expenses:
+        # The person who paid gets credited.
+        payer_id = expense.paid_by
+        balances[payer_id] = (
+            balances.get(payer_id, 0) + expense.amount_paise
+        )
+
+        # Each person's share is deducted from their balance.
+        for split in expense.splits:
+            user_id = split.user_id
+            balances[user_id] = (
+                balances.get(user_id, 0) - split.share_paise
+            )
+
+    return balances
+
+
+def calculate_balances(expenses, expense_splits):
+    """
+    Calculate each user's net balance.
+
+    Positive balance = user should receive money.
+    Negative balance = user owes money.
+    """
+
+    balances = {}
+
+    # Credit each payer with the amount they paid.
+    for expense in expenses:
+        balances[expense.paid_by] = (
+            balances.get(expense.paid_by, 0)
+            + expense.amount_paise
+        )
+
+    # Deduct each user's share from their balance.
+    for split in expense_splits:
+        balances[split.user_id] = (
+            balances.get(split.user_id, 0)
+            - split.share_paise
+        )
+
+    return balances
+
+
+def suggest_settlements(balances):
+    """
+    Convert net balances into settlement transactions.
+
+    Positive balance = should receive money.
+    Negative balance = owes money.
+
+    Returns tuples: (payer_id, receiver_id, amount_paise).
+    """
+    debtors = []
+    creditors = []
+
+    for user_id, balance in balances.items():
+        if balance < 0:
+            debtors.append([user_id, -balance])
+        elif balance > 0:
+            creditors.append([user_id, balance])
+
+    settlements = []
+    debtor_index = 0
+    creditor_index = 0
+
+    while (
+        debtor_index < len(debtors)
+        and creditor_index < len(creditors)
+    ):
+        debtor_id, debt = debtors[debtor_index]
+        creditor_id, credit = creditors[creditor_index]
+
+        amount = min(debt, credit)
+
+        settlements.append(
+            (debtor_id, creditor_id, amount)
+        )
+
+        debtors[debtor_index][1] -= amount
+        creditors[creditor_index][1] -= amount
+
+        if debtors[debtor_index][1] == 0:
+            debtor_index += 1
+
+        if creditors[creditor_index][1] == 0:
+            creditor_index += 1
+
+    return settlements

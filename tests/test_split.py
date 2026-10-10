@@ -149,3 +149,4 @@ def test_percentage_split_remainder():
     result = calculate_percentage_split(1, splits)
 
     assert sum(share for _, share in result) == 1
+
