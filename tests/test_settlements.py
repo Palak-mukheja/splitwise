@@ -48,3 +48,46 @@ def test_multiple_debtors_and_creditors():
 
     # The suggested transfers must exactly settle the original balances.
     assert net == balances
+
+
+def test_circular_debts():
+    balances = {
+        1: 0,
+        2: 0,
+        3: 0,
+    }
+
+    settlements = suggest_settlements(balances)
+
+    assert settlements == []
+
+
+def test_everyone_already_settled():
+    balances = {
+        1: 0,
+        2: 0,
+        3: 0,
+    }
+
+    settlements = suggest_settlements(balances)
+
+    assert settlements == []
+
+
+def test_suggested_settlements_clear_balances():
+    balances = {
+        1: 5000,
+        2: 7000,
+        3: -4000,
+        4: -8000,
+    }
+
+    settlements = suggest_settlements(balances)
+
+    remaining = balances.copy()
+
+    for payer_id, receiver_id, amount in settlements:
+        remaining[payer_id] += amount
+        remaining[receiver_id] -= amount
+
+    assert all(balance == 0 for balance in remaining.values())

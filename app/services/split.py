@@ -1,5 +1,5 @@
 from decimal import Decimal
-
+import heapq
 def calculate_equal_split(total_paise, member_ids):
     if total_paise <= 0:
         raise ValueError("Expense amount must be positive")
@@ -182,20 +182,18 @@ def suggest_settlements(balances):
 
     for user_id, balance in balances.items():
         if balance < 0:
-            debtors.append([user_id, -balance])
+            heapq.heappush(debtors, (balance, user_id))
         elif balance > 0:
-            creditors.append([user_id, balance])
+            heapq.heappush(creditors, (-balance, user_id))
 
     settlements = []
-    debtor_index = 0
-    creditor_index = 0
 
-    while (
-        debtor_index < len(debtors)
-        and creditor_index < len(creditors)
-    ):
-        debtor_id, debt = debtors[debtor_index]
-        creditor_id, credit = creditors[creditor_index]
+    while debtors and creditors:
+        debt, debtor_id = heapq.heappop(debtors)
+        credit, creditor_id = heapq.heappop(creditors)
+
+        debt = -debt
+        credit = -credit
 
         amount = min(debt, credit)
 
@@ -203,13 +201,13 @@ def suggest_settlements(balances):
             (debtor_id, creditor_id, amount)
         )
 
-        debtors[debtor_index][1] -= amount
-        creditors[creditor_index][1] -= amount
+        debt -= amount
+        credit -= amount
 
-        if debtors[debtor_index][1] == 0:
-            debtor_index += 1
+        if debt > 0:
+            heapq.heappush(debtors, (-debt, debtor_id))
 
-        if creditors[creditor_index][1] == 0:
-            creditor_index += 1
+        if credit > 0:
+            heapq.heappush(creditors, (-credit, creditor_id))
 
     return settlements
