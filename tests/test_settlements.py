@@ -39,15 +39,16 @@ def test_multiple_debtors_and_creditors():
     # Every settlement must be positive.
     assert all(amount > 0 for _, _, amount in settlements)
 
-    # Calculate how much each person pays or receives.
-    net = {user_id: 0 for user_id in balances}
+    
+    # Apply the suggested transactions to the original balances.
+    remaining = balances.copy()
 
     for payer_id, receiver_id, amount in settlements:
-        net[payer_id] -= amount
-        net[receiver_id] += amount
+        remaining[payer_id] += amount
+        remaining[receiver_id] -= amount
 
-    # The suggested transfers must exactly settle the original balances.
-    assert net == balances
+    # Everyone's balance should become zero.
+    assert all(balance == 0 for balance in remaining.values())
 
 
 def test_circular_debts():
@@ -91,3 +92,44 @@ def test_suggested_settlements_clear_balances():
         remaining[receiver_id] -= amount
 
     assert all(balance == 0 for balance in remaining.values())
+
+
+def test_one_person_owes_everyone():
+    balances = {
+        1: 9000,    # receives Rs. 90
+        2: 4000,    # receives Rs. 40
+        3: -13000,  # owes Rs. 130
+    }
+
+    settlements = suggest_settlements(balances)
+
+    remaining = balances.copy()
+
+    for payer_id, receiver_id, amount in settlements:
+        remaining[payer_id] += amount
+        remaining[receiver_id] -= amount
+
+    assert all(balance == 0 for balance in remaining.values())
+    assert len(settlements) == 2
+
+
+def test_settlements_clear_many_balance_combinations():
+    test_cases = [
+        {1: 10000, 2: -10000},
+        {1: 5000, 2: 7000, 3: -4000, 4: -8000},
+        {1: 9000, 2: 4000, 3: -13000},
+        {1: 15000, 2: -5000, 3: -3000, 4: -7000},
+        {1: 8000, 2: 6000, 3: -4000, 4: -10000},
+        {1: 1000, 2: 2000, 3: 3000, 4: -6000},
+    ]
+
+    for balances in test_cases:
+        settlements = suggest_settlements(balances)
+        remaining = balances.copy()
+
+        for payer_id, receiver_id, amount in settlements:
+            assert amount > 0
+            remaining[payer_id] += amount
+            remaining[receiver_id] -= amount
+
+        assert all(balance == 0 for balance in remaining.values())

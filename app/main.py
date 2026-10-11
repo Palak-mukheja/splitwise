@@ -24,7 +24,7 @@ from pwdlib import PasswordHash
 password_hash = PasswordHash.recommended()
 
 from app.schemas import LoginRequest, RegisterRequest, GroupCreate, AddMemberRequest
-from sqlalchemy import select
+from sqlalchemy import select,func
 from app.schemas import ExactExpenseCreate
 from app.services.split import calculate_exact_split
 
@@ -668,35 +668,49 @@ def get_group_balances(
                 detail="You are not a member of this group"
             )
 
-        # 2. Fetch all expenses in this group
-        stmt = select(Expense).where(
-            Expense.group_id == group_id
-        )
-        expenses = db.execute(stmt).scalars().all()
-
-        # 3. Fetch split records for those expenses
-        expense_ids = [expense.id for expense in expenses]
-
-        if expense_ids:
-            stmt = select(ExpenseSplit).where(
-                ExpenseSplit.expense_id.in_(expense_ids)
-            )
-            expense_splits = db.execute(stmt).scalars().all()
-        else:
-            expense_splits = []
-
-        # 4. Calculate balances
-        balances = calculate_balances(expenses, expense_splits)
-
-        # 5. Include group members with zero balances
+        # 2. Get all member IDs, including members with zero balances
         stmt = select(GroupMember.user_id).where(
             GroupMember.group_id == group_id
         )
         member_ids = db.execute(stmt).scalars().all()
 
-        for user_id in member_ids:
-            balances.setdefault(user_id, 0)
+        balances = {user_id: 0 for user_id in member_ids}
 
+        # 3. Aggregate the amount paid by each user in SQL
+        stmt = (
+            select(
+                Expense.paid_by,
+                func.sum(Expense.amount_paise)
+            )
+            .where(Expense.group_id == group_id)
+            .group_by(Expense.paid_by)
+        )
+
+        paid_totals = db.execute(stmt).all()
+
+        for user_id, total_paid in paid_totals:
+            balances[user_id] += total_paid
+
+        # 4. Aggregate each user's shares in SQL
+        stmt = (
+            select(
+                ExpenseSplit.user_id,
+                func.sum(ExpenseSplit.share_paise)
+            )
+            .join(
+                Expense,
+                Expense.id == ExpenseSplit.expense_id
+            )
+            .where(Expense.group_id == group_id)
+            .group_by(ExpenseSplit.user_id)
+        )
+
+        share_totals = db.execute(stmt).all()
+
+        for user_id, total_shares in share_totals:
+            balances[user_id] -= total_shares
+
+        # 5. Return balances in a consistent order
         return {
             "group_id": group_id,
             "balances": [
@@ -710,7 +724,7 @@ def get_group_balances(
 
     finally:
         db.close()
-        
+
 
 @app.get("/groups/{group_id}/settlements/suggestions")
 def get_settlement_suggestions(
