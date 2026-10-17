@@ -1,4 +1,12 @@
 from dataclasses import Field
+from fastapi import HTTPException
+from redis.exceptions import RedisError
+from app.redis_client import (
+    check_login_rate_limit,
+    get_cached_balances,
+    cache_balances,
+    invalidate_balance_cache,
+)
 from app.services.split import calculate_equal_split
 from pydantic import BaseModel, Field, EmailStr
 from fastapi import FastAPI
@@ -18,7 +26,9 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
 from datetime import datetime, timedelta, timezone
 
-SECRET_KEY = "your-secret-key-change-this-later"
+import os
+
+SECRET_KEY = os.getenv("SECRET_KEY", "development-only-change-me")
 ALGORITHM = "HS256"
 
 from app.schemas import ExpenseCreate
@@ -101,6 +111,12 @@ app = FastAPI()
 def home():
     return {"message": "Welcome to SplitEasy!"}
 
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
+
 @app.get("/hello/{name}")
 def say_hello(name: str):
     return {"message": f"Hello {name}!"}
@@ -162,7 +178,7 @@ def get_groups(
         }
         for group in groups
     ]
-    
+
 @app.get("/groups/{group_id}/expenses")
 def get_group_expenses(
     group_id: int,
@@ -255,7 +271,7 @@ def get_group_expenses(
 class SettlementCreate(BaseModel):
     to_user: int
     amount_paise: int = Field(gt=0)
-    
+
 
 @app.post("/auth/register")
 def register(user: RegisterRequest):
@@ -289,38 +305,62 @@ def register(user: RegisterRequest):
         "name": new_user.name,
         "created_at": new_user.created_at
     }
-  
+
+
 @app.post("/auth/login")
 def login(user: LoginRequest):
+    # Step 1: Check the Redis rate limit before processing login.
+    try:
+        allowed = check_login_rate_limit(user.email)
+    except RedisError:
+        raise HTTPException(
+            status_code=503,
+            detail="Login service temporarily unavailable",
+        )
+
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many login attempts. Try again in a minute.",
+        )
+
+    # Step 2: Check the user in PostgreSQL.
     db = SessionLocal()
+    try:
+        stmt = select(User).where(User.email == user.email)
+        existing_user = db.execute(stmt).scalar_one_or_none()
 
-    stmt = select(User).where(User.email == user.email)
-    result = db.execute(stmt)
-    existing_user = result.scalar_one_or_none()
+        if not existing_user:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid email or password",
+            )
 
-    if not existing_user:
+        # Step 3: Verify the password.
+        password_valid = password_hash.verify(
+            user.password,
+            existing_user.password_hash,
+        )
+
+        if not password_valid:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid email or password",
+            )
+
+        # Step 4: Generate tokens after successful authentication.
+        access_token = create_access_token(existing_user.id)
+        refresh_token = create_refresh_token(existing_user.id)
+
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+        }
+    finally:
         db.close()
-        return {"error": "Invalid email or password"}
 
-    password_valid = password_hash.verify(
-        user.password,
-        existing_user.password_hash
-    )
 
-    if not password_valid:
-        db.close()
-        return {"error": "Invalid email or password"}
-    
-    access_token = create_access_token(existing_user.id)
-    refresh_token = create_refresh_token(existing_user.id)
-    
-    db.close()
-    return {
-    "access_token": access_token,
-    "refresh_token": refresh_token,
-    "token_type": "bearer"
-}
-    
 @app.post("/auth/refresh")
 def refresh_access_token(refresh_token: str):
     try:
@@ -350,7 +390,7 @@ def refresh_access_token(refresh_token: str):
         "access_token": new_access_token,
         "token_type": "bearer"
     }
-    
+
 @app.get("/me")
 def get_me(current_user: User = Depends(get_current_user)):
     return {
@@ -359,7 +399,7 @@ def get_me(current_user: User = Depends(get_current_user)):
         "name": current_user.name,
         "created_at": current_user.created_at
     }
-    
+
 @app.get("/groups/{group_id}/expenses")
 def get_group_expenses(
     group_id: int,
@@ -476,7 +516,7 @@ def create_expense(
                 GroupMember.group_id == group_id
             )
         ).scalars().all()
-         
+
         splits = calculate_equal_split(
            expense.amount_paise,
            members,
@@ -509,6 +549,8 @@ def create_expense(
 
         db.commit()
         db.refresh(new_expense)
+        invalidate_balance_cache(group_id)
+
 
         return {
             "id": new_expense.id,
@@ -571,7 +613,7 @@ def create_exact_expense(
                     detail=f"User {split_item.user_id} is not a member of this group"
                 )
 
-      
+
         splits = calculate_equal_split(
             new_expense.amount_paise,
             member_ids
@@ -598,11 +640,10 @@ def create_exact_expense(
                     share_paise=share_paise
                 )
             )
-
-        # 8. Save everything together
+       # 8. Save everything together
         db.commit()
         db.refresh(new_expense)
-
+        invalidate_balance_cache(group_id)
         return {
             "id": new_expense.id,
             "group_id": new_expense.group_id,
@@ -690,9 +731,9 @@ def create_percentage_expense(
             amount_paise=expense.amount_paise,
             description=expense.description
         )
-        db.add(new_expense)
-        db.flush()
-
+        db.commit()
+        db.refresh(new_expense)
+        invalidate_balance_cache(group_id)
         # 7. Create the split records
         for user_id, share_paise in splits:
             db.add(
@@ -702,7 +743,6 @@ def create_percentage_expense(
                     share_paise=share_paise
                 )
             )
-
         # 8. Save everything in one transaction
         db.commit()
         db.refresh(new_expense)
@@ -738,25 +778,31 @@ def create_percentage_expense(
 @app.get("/groups/{group_id}/balances")
 def get_group_balances(
     group_id: int,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     db = SessionLocal()
 
     try:
-        # 1. Check group membership
+        # 1. Check membership BEFORE returning cached data.
         stmt = select(GroupMember).where(
             GroupMember.group_id == group_id,
-            GroupMember.user_id == current_user.id
+            GroupMember.user_id == current_user.id,
         )
         membership = db.execute(stmt).scalar_one_or_none()
 
         if membership is None:
             raise HTTPException(
                 status_code=403,
-                detail="You are not a member of this group"
+                detail="You are not a member of this group",
             )
 
-        # 2. Get all member IDs, including members with zero balances
+        # 2. Try Redis cache.
+        cached_balances = get_cached_balances(group_id)
+
+        if cached_balances is not None:
+            return cached_balances
+
+        # 3. Initialize every group member's balance to zero.
         stmt = select(GroupMember.user_id).where(
             GroupMember.group_id == group_id
         )
@@ -764,43 +810,44 @@ def get_group_balances(
 
         balances = {user_id: 0 for user_id in member_ids}
 
-        # 3. Aggregate the amount paid by each user in SQL
+        # 4. Aggregate the amount paid by each user.
         stmt = (
             select(
                 Expense.paid_by,
-                func.sum(Expense.amount_paise)
+                func.sum(Expense.amount_paise),
             )
             .where(Expense.group_id == group_id)
             .group_by(Expense.paid_by)
         )
-
         paid_totals = db.execute(stmt).all()
 
         for user_id, total_paid in paid_totals:
             balances[user_id] += total_paid
 
-        # 4. Aggregate each user's shares in SQL
+        # 5. Aggregate each user's shares.
         stmt = (
             select(
                 ExpenseSplit.user_id,
-                func.sum(ExpenseSplit.share_paise)
+                func.sum(ExpenseSplit.share_paise),
             )
             .join(
                 Expense,
-                Expense.id == ExpenseSplit.expense_id
+                Expense.id == ExpenseSplit.expense_id,
             )
             .where(Expense.group_id == group_id)
             .group_by(ExpenseSplit.user_id)
         )
-
         share_totals = db.execute(stmt).all()
 
         for user_id, total_shares in share_totals:
             balances[user_id] -= total_shares
 
-        # 5. Aggregate settlements paid by each user.
+        # 6. Add settlements paid by each user.
         stmt = (
-            select(Settlement.from_user, func.sum(Settlement.amount_paise))
+            select(
+                Settlement.from_user,
+                func.sum(Settlement.amount_paise),
+            )
             .where(Settlement.group_id == group_id)
             .group_by(Settlement.from_user)
         )
@@ -809,9 +856,12 @@ def get_group_balances(
         for user_id, total_paid in paid_settlements:
             balances[user_id] += total_paid
 
-        # 6. Aggregate settlements received by each user.
+        # 7. Subtract settlements received by each user.
         stmt = (
-            select(Settlement.to_user, func.sum(Settlement.amount_paise))
+            select(
+                Settlement.to_user,
+                func.sum(Settlement.amount_paise),
+            )
             .where(Settlement.group_id == group_id)
             .group_by(Settlement.to_user)
         )
@@ -820,20 +870,26 @@ def get_group_balances(
         for user_id, total_received in received_settlements:
             balances[user_id] -= total_received
 
-        # 7. Return balances in a consistent order
-        return {
+        # 8. Build the same response format as before.
+        response = {
             "group_id": group_id,
             "balances": [
                 {
                     "user_id": user_id,
-                    "balance_paise": balance
+                    "balance_paise": balance,
                 }
                 for user_id, balance in sorted(balances.items())
-            ]
+            ],
         }
+
+        # 9. Cache the result for 60 seconds.
+        cache_balances(group_id, response)
+
+        return response
 
     finally:
         db.close()
+
 
 
 @app.post("/groups/{group_id}/settlements")
@@ -891,7 +947,7 @@ def create_settlement(
         db.add(new_settlement)
         db.commit()
         db.refresh(new_settlement)
-
+        invalidate_balance_cache(group_id)
         return {
             "id": new_settlement.id,
             "group_id": new_settlement.group_id,
@@ -968,4 +1024,4 @@ def get_settlement_suggestions(
         db.close()
 
 
-    
+
