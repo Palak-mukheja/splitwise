@@ -1,3 +1,6 @@
+from dataclasses import Field
+from app.services.split import calculate_equal_split
+from pydantic import BaseModel, Field, EmailStr
 from fastapi import FastAPI
 from app.schemas import PercentageExpenseCreate
 from app.services.split import calculate_balances
@@ -29,7 +32,7 @@ from app.schemas import ExactExpenseCreate
 from app.services.split import calculate_exact_split
 
 from app.database import SessionLocal
-from app.models import User, Group, GroupMember, Expense, ExpenseSplit
+from app.models import User, Group, GroupMember, Expense, ExpenseSplit, Settlement
 
 
 def create_access_token(user_id: int):
@@ -160,68 +163,99 @@ def get_groups(
         for group in groups
     ]
     
-@app.post("/groups/{group_id}/members")
-def add_member(
+@app.get("/groups/{group_id}/expenses")
+def get_group_expenses(
     group_id: int,
-    member: AddMemberRequest,
-    current_user: User = Depends(get_current_user)
+    page: int = 1,
+    limit: int = 10,
+    category: str | None = None,
+    member_id: int | None = None,
+    start_date: datetime | None = None,
+    end_date: datetime | None = None,
+    current_user: User = Depends(get_current_user),
 ):
-    db = SessionLocal()
+    if page < 1:
+        raise HTTPException(status_code=400, detail="Page must be at least 1")
 
-    stmt = select(GroupMember).where(
-        GroupMember.group_id == group_id,
-        GroupMember.user_id == current_user.id
-    )
-
-    result = db.execute(stmt)
-    existing_membership = result.scalar_one_or_none()
-
-    if existing_membership is None:
-        db.close()
-        raise HTTPException(
-            status_code=403,
-            detail="You are not a member of this group"
-        )
-    stmt = select(User).where(User.id == member.user_id)
-
-    result = db.execute(stmt)
-    user_to_add = result.scalar_one_or_none()
-    if user_to_add is None:
-        db.close()
-        raise HTTPException(
-            status_code=404,
-            detail="User not found"
-        )
-
-    stmt = select(GroupMember).where(
-        GroupMember.group_id == group_id,
-        GroupMember.user_id == member.user_id
-    )
-
-    result = db.execute(stmt)
-    already_member = result.scalar_one_or_none()
-
-    if already_member is not None:
-        db.close()
+    if limit < 1 or limit > 100:
         raise HTTPException(
             status_code=400,
-            detail="User is already a member of this group"
+            detail="Limit must be between 1 and 100",
         )
 
-    new_member = GroupMember(
-        group_id=group_id,
-        user_id=member.user_id
-    )
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(
+            status_code=400,
+            detail="start_date cannot be after end_date",
+        )
 
-    db.add(new_member)
-    db.commit()
-    db.close()
+    db = SessionLocal()
+    try:
+        membership = db.execute(
+            select(GroupMember).where(
+                GroupMember.group_id == group_id,
+                GroupMember.user_id == current_user.id,
+            )
+        ).scalar_one_or_none()
 
-    return {
-        "message": "User added to group",
-        "group_id": group_id,
-        "user_id": member.user_id
-    }
+        if membership is None:
+            raise HTTPException(
+                status_code=403,
+                detail="You are not a member of this group",
+            )
+
+        stmt = select(Expense).where(Expense.group_id == group_id)
+
+        if category is not None:
+            stmt = stmt.where(Expense.category == category)
+
+        if member_id is not None:
+            stmt = stmt.where(Expense.paid_by == member_id)
+
+        if start_date is not None:
+            stmt = stmt.where(Expense.created_at >= start_date)
+
+        if end_date is not None:
+            stmt = stmt.where(Expense.created_at <= end_date)
+
+        count_stmt = select(func.count()).select_from(
+            stmt.order_by(None).subquery()
+        )
+        total = db.execute(count_stmt).scalar_one()
+
+        offset = (page - 1) * limit
+        stmt = stmt.order_by(
+            Expense.created_at.desc(),
+            Expense.id.desc(),
+        ).offset(offset).limit(limit)
+
+        expenses = db.execute(stmt).scalars().all()
+
+        return {
+            "group_id": group_id,
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "total_pages": (total + limit - 1) // limit,
+            "expenses": [
+                {
+                    "id": expense.id,
+                    "paid_by": expense.paid_by,
+                    "amount_paise": expense.amount_paise,
+                    "description": expense.description,
+                    "category": expense.category,
+                    "created_at": expense.created_at,
+                }
+                for expense in expenses
+            ],
+        }
+    finally:
+        db.close()
+
+class SettlementCreate(BaseModel):
+    to_user: int
+    amount_paise: int = Field(gt=0)
+    
 
 @app.post("/auth/register")
 def register(user: RegisterRequest):
@@ -326,86 +360,152 @@ def get_me(current_user: User = Depends(get_current_user)):
         "created_at": current_user.created_at
     }
     
+@app.get("/groups/{group_id}/expenses")
+def get_group_expenses(
+    group_id: int,
+    page: int = 1,
+    limit: int = 10,
+    category: str | None = None,
+    member_id: int | None = None,
+    start_date: datetime | None = None,
+    end_date: datetime | None = None,
+    current_user: User = Depends(get_current_user),
+):
+    if page < 1:
+        raise HTTPException(status_code=400, detail="Page must be at least 1")
+
+    if limit < 1 or limit > 100:
+        raise HTTPException(
+            status_code=400,
+            detail="Limit must be between 1 and 100",
+        )
+
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(
+            status_code=400,
+            detail="start_date cannot be after end_date",
+        )
+
+    db = SessionLocal()
+    try:
+        membership = db.execute(
+            select(GroupMember).where(
+                GroupMember.group_id == group_id,
+                GroupMember.user_id == current_user.id,
+            )
+        ).scalar_one_or_none()
+
+        if membership is None:
+            raise HTTPException(
+                status_code=403,
+                detail="You are not a member of this group",
+            )
+
+        stmt = select(Expense).where(Expense.group_id == group_id)
+
+        if category is not None:
+            stmt = stmt.where(Expense.category == category)
+
+        if member_id is not None:
+            stmt = stmt.where(Expense.paid_by == member_id)
+
+        if start_date is not None:
+            stmt = stmt.where(Expense.created_at >= start_date)
+
+        if end_date is not None:
+            stmt = stmt.where(Expense.created_at <= end_date)
+
+        count_stmt = select(func.count()).select_from(
+            stmt.order_by(None).subquery()
+        )
+        total = db.execute(count_stmt).scalar_one()
+
+        offset = (page - 1) * limit
+        stmt = stmt.order_by(
+            Expense.created_at.desc(),
+            Expense.id.desc(),
+        ).offset(offset).limit(limit)
+
+        expenses = db.execute(stmt).scalars().all()
+
+        return {
+            "group_id": group_id,
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "total_pages": (total + limit - 1) // limit,
+            "expenses": [
+                {
+                    "id": expense.id,
+                    "paid_by": expense.paid_by,
+                    "amount_paise": expense.amount_paise,
+                    "description": expense.description,
+                    "category": expense.category,
+                    "created_at": expense.created_at,
+                }
+                for expense in expenses
+            ],
+        }
+    finally:
+        db.close()
+
 
 @app.post("/groups/{group_id}/expenses")
 def create_expense(
     group_id: int,
     expense: ExpenseCreate,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     db = SessionLocal()
-
     try:
-        # 1. Check whether the current user belongs to the group
-        stmt = select(GroupMember).where(
-            GroupMember.group_id == group_id,
-            GroupMember.user_id == current_user.id
-        )
+        membership = db.execute(
+            select(GroupMember).where(
+                GroupMember.group_id == group_id,
+                GroupMember.user_id == current_user.id,
+            )
+        ).scalar_one_or_none()
 
-        result = db.execute(stmt)
-        current_user_membership = result.scalar_one_or_none()
-
-        if current_user_membership is None:
+        if membership is None:
             raise HTTPException(
                 status_code=403,
-                detail="You are not a member of this group"
+                detail="You are not a member of this group",
             )
 
-        # 2. Check whether the payer belongs to the group
-        stmt = select(GroupMember).where(
-            GroupMember.group_id == group_id,
-            GroupMember.user_id == expense.paid_by
-        )
-
-        result = db.execute(stmt)
-        paid_by_membership = result.scalar_one_or_none()
-
-        if expense.amount_paise <= 0:
+        members = db.execute(
+            select(GroupMember.user_id).where(
+                GroupMember.group_id == group_id
+            )
+        ).scalars().all()
+         
+        splits = calculate_equal_split(
+           expense.amount_paise,
+           members,
+           )
+        if expense.paid_by != current_user.id:
             raise HTTPException(
-                status_code=400,
-                detail="Expense amount must be positive"
+                status_code=403,
+                detail="You can only record an expense that you paid for",
             )
 
-        if paid_by_membership is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Payer is not a member of this group"
-            )
+        ssplits = calculate_equal_split(expense.amount_paise, members)
 
         new_expense = Expense(
             group_id=group_id,
             paid_by=expense.paid_by,
             amount_paise=expense.amount_paise,
-            description=expense.description
+            description=expense.description,
         )
-
         db.add(new_expense)
         db.flush()
 
-        stmt = select(GroupMember).where(
-            GroupMember.group_id == group_id
-        )
-
-        result = db.execute(stmt)
-        memberships = result.scalars().all()
-
-        member_ids = [
-            membership.user_id
-            for membership in memberships
-        ]
-
-        splits = calculate_equal_split(
-       new_expense.amount_paise,
-       member_ids
-)
-
         for user_id, share_paise in splits:
-            split = ExpenseSplit(
-                expense_id=new_expense.id,
-                user_id=user_id,
-                share_paise=share_paise
-            )
-            db.add(split)
+         db.add(
+        ExpenseSplit(
+            expense_id=new_expense.id,
+            user_id=user_id,
+            share_paise=share_paise,
+        )
+    )
 
         db.commit()
         db.refresh(new_expense)
@@ -416,20 +516,8 @@ def create_expense(
             "paid_by": new_expense.paid_by,
             "amount_paise": new_expense.amount_paise,
             "description": new_expense.description,
-            "splits": [
-                {
-                    "user_id": user_id,
-                    "share_paise": share_paise
-                }
-                for user_id, share_paise in splits
-            ]
         }
-    except ValueError as error:
-        db.rollback()
-        raise HTTPException(
-            status_code=400,
-            detail=str(error)
-        )
+
     except Exception:
         db.rollback()
         raise
@@ -710,7 +798,29 @@ def get_group_balances(
         for user_id, total_shares in share_totals:
             balances[user_id] -= total_shares
 
-        # 5. Return balances in a consistent order
+        # 5. Aggregate settlements paid by each user.
+        stmt = (
+            select(Settlement.from_user, func.sum(Settlement.amount_paise))
+            .where(Settlement.group_id == group_id)
+            .group_by(Settlement.from_user)
+        )
+        paid_settlements = db.execute(stmt).all()
+
+        for user_id, total_paid in paid_settlements:
+            balances[user_id] += total_paid
+
+        # 6. Aggregate settlements received by each user.
+        stmt = (
+            select(Settlement.to_user, func.sum(Settlement.amount_paise))
+            .where(Settlement.group_id == group_id)
+            .group_by(Settlement.to_user)
+        )
+        received_settlements = db.execute(stmt).all()
+
+        for user_id, total_received in received_settlements:
+            balances[user_id] -= total_received
+
+        # 7. Return balances in a consistent order
         return {
             "group_id": group_id,
             "balances": [
@@ -721,6 +831,79 @@ def get_group_balances(
                 for user_id, balance in sorted(balances.items())
             ]
         }
+
+    finally:
+        db.close()
+
+
+@app.post("/groups/{group_id}/settlements")
+def create_settlement(
+    group_id: int,
+    settlement: SettlementCreate,
+    current_user: User = Depends(get_current_user)
+):
+    db = SessionLocal()
+
+    try:
+        # 1. Verify that the payer belongs to the group.
+        payer_membership = db.execute(
+            select(GroupMember).where(
+                GroupMember.group_id == group_id,
+                GroupMember.user_id == current_user.id
+            )
+        ).scalar_one_or_none()
+
+        if payer_membership is None:
+            raise HTTPException(
+                status_code=403,
+                detail="You are not a member of this group"
+            )
+
+        # 2. Verify that the recipient belongs to the same group.
+        recipient_membership = db.execute(
+            select(GroupMember).where(
+                GroupMember.group_id == group_id,
+                GroupMember.user_id == settlement.to_user
+            )
+        ).scalar_one_or_none()
+
+        if recipient_membership is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Recipient is not a member of this group"
+            )
+
+        # 3. A user cannot pay themselves.
+        if current_user.id == settlement.to_user:
+            raise HTTPException(
+                status_code=400,
+                detail="You cannot settle a payment with yourself"
+            )
+
+        # 4. Create the settlement record.
+        new_settlement = Settlement(
+            group_id=group_id,
+            from_user=current_user.id,
+            to_user=settlement.to_user,
+            amount_paise=settlement.amount_paise
+        )
+
+        db.add(new_settlement)
+        db.commit()
+        db.refresh(new_settlement)
+
+        return {
+            "id": new_settlement.id,
+            "group_id": new_settlement.group_id,
+            "from_user": new_settlement.from_user,
+            "to_user": new_settlement.to_user,
+            "amount_paise": new_settlement.amount_paise,
+            "created_at": new_settlement.created_at
+        }
+
+    except Exception:
+        db.rollback()
+        raise
 
     finally:
         db.close()
@@ -783,3 +966,6 @@ def get_settlement_suggestions(
 
     finally:
         db.close()
+
+
+    
