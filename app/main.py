@@ -1,4 +1,7 @@
 from dataclasses import Field
+from fastapi.responses import JSONResponse
+import logging
+import time
 from fastapi import HTTPException
 from redis.exceptions import RedisError
 from app.redis_client import (
@@ -27,7 +30,11 @@ import jwt
 from datetime import datetime, timedelta, timezone
 
 import os
-
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("spliteasy")
 SECRET_KEY = os.getenv("SECRET_KEY", "development-only-change-me")
 ALGORITHM = "HS256"
 
@@ -105,6 +112,54 @@ def get_current_user(
     return existing_user
 
 app = FastAPI()
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    logger.exception(
+        "unhandled_exception method=%s path=%s",
+        request.method,
+        request.url.path,
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal server error"
+        },
+    )
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+
+logger = logging.getLogger("spliteasy")
+
+
+@app.middleware("http")
+async def log_requests(request, call_next):
+    start_time = time.perf_counter()
+
+    try:
+        response = await call_next(request)
+        duration_ms = (time.perf_counter() - start_time) * 1000
+
+        logger.info(
+            "request_completed method=%s path=%s status_code=%s duration_ms=%.2f",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration_ms,
+        )
+
+        return response
+
+    except Exception:
+        logger.exception(
+            "request_failed method=%s path=%s",
+            request.method,
+            request.url.path,
+        )
+        raise
 
 
 @app.get("/")
